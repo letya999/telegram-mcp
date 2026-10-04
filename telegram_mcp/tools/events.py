@@ -21,6 +21,7 @@ from telethon import utils
 
 from telegram_mcp.runtime import *  # mcp, clients, ToolAnnotations, log_and_format_error
 from telegram_mcp.floodgate import state_dir
+from telegram_mcp.state import atomic_write_json
 
 # chat_id -> {first_ts, last_ts, count, first_id, last_id, name, username, kind, topic_id, sender_id}
 _pending_msgs: Dict[int, Dict[str, Any]] = {}
@@ -147,19 +148,12 @@ def _load_pending_state() -> None:
 
 
 def _save_pending_state() -> None:
-    """Persist pending bursts + dedup set (atomic-ish via tmp+replace)."""
-    path = _pending_file()
+    """Persist pending bursts + dedup set (atomic via tmp+fsync+replace)."""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(
-            json.dumps(
-                {"pending": _pending_msgs, "seen": list(_seen_ids)[-_SEEN_CAP:]},
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
+        atomic_write_json(
+            _pending_file(),
+            {"pending": _pending_msgs, "seen": list(_seen_ids)[-_SEEN_CAP:]},
         )
-        os.replace(tmp, path)
     except OSError:
         logging.getLogger("telegram_mcp").error("Could not persist incoming-message state")
 

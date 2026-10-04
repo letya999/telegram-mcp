@@ -35,6 +35,7 @@ from telethon.errors import FloodWaitError, RPCError
 from telethon.tl import types
 
 from telegram_mcp.floodgate import state_dir
+from telegram_mcp.state import append_jsonl
 
 STATUS_CONFIRMED = "confirmed"
 STATUS_DEFERRED = "deferred"
@@ -92,9 +93,7 @@ class OperationJournal:
             "ts": round(time.time(), 2),
             **fields,
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        append_jsonl(self.path, rec)
         self._load()[operation_id] = rec
         return rec
 

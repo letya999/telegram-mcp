@@ -34,6 +34,8 @@ from typing import Optional
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 
+from telegram_mcp.state import atomic_write_json
+
 
 def state_dir() -> Path:
     """State directory, following the aliases-file convention (XDG-aware)."""
@@ -84,10 +86,7 @@ class FloodWaitState:
         """
         until = time.time() + max(0.0, float(seconds))
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_name(self.path.name + ".tmp")
-            tmp.write_text(json.dumps({"until": until}), encoding="utf-8")
-            os.replace(tmp, self.path)
+            atomic_write_json(self.path, {"until": until})
         except OSError as exc:
             raise RuntimeError(
                 f"FloodWait deadline could not be persisted to {self.path}; "
