@@ -90,7 +90,7 @@ def test_flood_sleep_threshold_invalid_falls_back(monkeypatch):
 
 def test_build_client_passes_flood_sleep_threshold(monkeypatch):
     monkeypatch.setenv("TELEGRAM_FLOOD_SLEEP_THRESHOLD", "25")
-    with patch("telegram_mcp.runtime.TelegramClient") as mock_tc:
+    with patch("telegram_mcp.runtime.GatedTelegramClient") as mock_tc:
         _build_client("dummy_session", "default")
         mock_tc.assert_called_once()
         _, kwargs = mock_tc.call_args

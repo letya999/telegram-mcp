@@ -62,7 +62,8 @@ try:
 except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None
 
-from telegram_mcp.singleton import try_lock_exclusive
+from telegram_mcp.singleton import session_identity, try_lock_exclusive
+from telegram_mcp.floodgate import GatedTelegramClient, FloodWaitState, flood_state_path
 
 from functools import wraps
 import telethon.errors.rpcerrorlist
@@ -578,7 +579,11 @@ def _build_client(session: Any, label: str) -> TelegramClient:
     # Read flood sleep threshold dynamically so runtime env changes take effect
     kwargs["flood_sleep_threshold"] = _get_flood_sleep_threshold()
     kwargs.update(client_identity_kwargs())
-    return TelegramClient(session, TELEGRAM_API_ID, TELEGRAM_API_HASH, **kwargs)
+    client = GatedTelegramClient(session, TELEGRAM_API_ID, TELEGRAM_API_HASH, **kwargs)
+    # A FloodWait deadline outlives the process: persist it keyed by this
+    # session's identity so a restarted worker cannot retry early.
+    client._flood_gate = FloodWaitState(flood_state_path(session_identity(client), label))
+    return client
 
 
 # --- Session pool ------------------------------------------------------------
