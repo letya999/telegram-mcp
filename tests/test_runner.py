@@ -577,3 +577,70 @@ def test_main_prints_the_tools_exposure_hides(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "hides 2 tool(s)" in err
     assert "export_chat_invite, send_message" in err
+
+
+def _with_me(client, **me_kwargs):
+    """Give a _FakeClient a get_me() returning a SimpleNamespace with the given fields."""
+
+    async def fake_get_me():
+        me_kwargs.setdefault("username", None)
+        me_kwargs.setdefault("usernames", None)
+        return SimpleNamespace(**me_kwargs)
+
+    client.get_me = fake_get_me
+    return client
+
+
+@pytest.mark.asyncio
+async def test_connect_authorized_client_accepts_expected_user_id(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_EXPECTED_USER_ID", "777000")
+    client = _with_me(_FakeClient(authorized=True), id=777000)
+
+    await runner._connect_authorized_client("default", client)
+
+    assert client.disconnected is False
+
+
+@pytest.mark.asyncio
+async def test_connect_authorized_client_rejects_wrong_user_id(monkeypatch):
+    """The numeric ID is the binding a username cannot fake: an account that
+    holds the expected handle but has another ID is still refused."""
+    monkeypatch.setenv("TELEGRAM_EXPECTED_USER_ID", "777000")
+    client = _with_me(_FakeClient(authorized=True), id=111222, username="work_account")
+
+    with pytest.raises(RuntimeError, match="TELEGRAM_EXPECTED_USER_ID") as excinfo:
+        await runner._connect_authorized_client("default", client)
+
+    assert "different account" in str(excinfo.value)
+    assert client.disconnected is True
+
+
+@pytest.mark.asyncio
+async def test_connect_authorized_client_checks_both_id_and_username(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_EXPECTED_USER_ID", "777000")
+    monkeypatch.setenv("TELEGRAM_EXPECTED_USERNAME", "work_account")
+    client = _with_me(_FakeClient(authorized=True), id=777000, username="other")
+
+    with pytest.raises(RuntimeError, match="TELEGRAM_EXPECTED_USERNAME"):
+        await runner._connect_authorized_client("default", client)
+
+    assert client.disconnected is True
+
+
+@pytest.mark.asyncio
+async def test_connect_authorized_client_per_label_user_id(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_EXPECTED_USER_ID_WORK", "555")
+    client = _with_me(_FakeClient(authorized=True), id=777000)
+
+    with pytest.raises(RuntimeError, match="TELEGRAM_EXPECTED_USER_ID_WORK"):
+        await runner._connect_authorized_client("work", client)
+
+
+def test_expected_user_id_rejects_non_numeric(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_EXPECTED_USER_ID", "@not_a_number")
+    with pytest.raises(SystemExit, match="Invalid TELEGRAM_EXPECTED_USER_ID"):
+        runner._expected_user_id("default")
+
+
+def test_expected_user_id_unset_returns_none():
+    assert runner._expected_user_id("default") is None

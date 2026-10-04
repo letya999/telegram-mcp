@@ -19,7 +19,7 @@ def transcript_cache_dir(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _clear_expected_username(monkeypatch):
-    """Keep a developer's TELEGRAM_EXPECTED_USERNAME* (.env) away from fake clients."""
+    """Keep a developer's TELEGRAM_EXPECTED_* (.env) away from fake clients."""
     for key in list(os.environ):
-        if key.startswith("TELEGRAM_EXPECTED_USERNAME"):
+        if key.startswith("TELEGRAM_EXPECTED_"):
             monkeypatch.delenv(key, raising=False)

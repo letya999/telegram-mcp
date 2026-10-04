@@ -75,20 +75,51 @@ def _expected_username(label: str) -> str:
     return _normalize_username(raw)
 
 
-async def _verify_expected_username(label: str, client) -> None:
+def _expected_user_id(label: str) -> Optional[int]:
+    """TELEGRAM_EXPECTED_USER_ID_<LABEL>, else TELEGRAM_EXPECTED_USER_ID; None if unset.
+
+    Usernames are optional and can be changed or released; the numeric account
+    ID cannot. A deployment that must bind a session to one specific account
+    (e.g. a broker-issued worker) should pin the ID, not just the handle.
+    """
+    raw = os.getenv(f"TELEGRAM_EXPECTED_USER_ID_{label.upper()}") or os.getenv(
+        "TELEGRAM_EXPECTED_USER_ID"
+    )
+    if not raw or not raw.strip():
+        return None
+    try:
+        return int(raw.strip())
+    except ValueError:
+        raise SystemExit(
+            f"Invalid TELEGRAM_EXPECTED_USER_ID '{raw}'. Expected a numeric Telegram user ID."
+        )
+
+
+async def _verify_expected_account(label: str, client) -> None:
     """Refuse to serve a session logged in to a different account."""
-    expected = _expected_username(label)
-    if not expected:
+    expected_username = _expected_username(label)
+    expected_user_id = _expected_user_id(label)
+    if not expected_username and expected_user_id is None:
         return
 
     me = await client.get_me()
-    usernames = {_normalize_username(getattr(me, "username", None))}
-    for entry in getattr(me, "usernames", None) or []:
-        if getattr(entry, "active", False):
-            usernames.add(_normalize_username(getattr(entry, "username", None)))
-    usernames.discard("")
+    mismatched: list[str] = []
 
-    if expected in usernames:
+    if expected_user_id is not None and getattr(me, "id", None) != expected_user_id:
+        mismatched.append(f"TELEGRAM_EXPECTED_USER_ID_{label.upper()} / TELEGRAM_EXPECTED_USER_ID")
+
+    if expected_username:
+        usernames = {_normalize_username(getattr(me, "username", None))}
+        for entry in getattr(me, "usernames", None) or []:
+            if getattr(entry, "active", False):
+                usernames.add(_normalize_username(getattr(entry, "username", None)))
+        usernames.discard("")
+        if expected_username not in usernames:
+            mismatched.append(
+                f"TELEGRAM_EXPECTED_USERNAME_{label.upper()} / TELEGRAM_EXPECTED_USERNAME"
+            )
+
+    if not mismatched:
         return
 
     try:
@@ -97,7 +128,7 @@ async def _verify_expected_username(label: str, client) -> None:
         pass
     raise RuntimeError(
         f"Telegram client '{label}' is logged in to a different account than "
-        f"TELEGRAM_EXPECTED_USERNAME_{label.upper()} / TELEGRAM_EXPECTED_USERNAME expects."
+        f"{' and '.join(mismatched)} expects."
     )
 
 
@@ -144,7 +175,7 @@ async def _connect_authorized_client(label, client) -> None:
             await asyncio.sleep(delay)
 
     if await client.is_user_authorized():
-        await _verify_expected_username(label, client)
+        await _verify_expected_account(label, client)
         return
 
     raise RuntimeError(
