@@ -42,6 +42,16 @@ _seen_ids: Dict[str, None] = {}  # insertion-ordered set of "chat_id:msg_id"
 _self_ids: Dict[int, Optional[int]] = {}
 _pending_loaded = False
 
+# Delivered bursts form a small outbox: a tool handing a burst to its caller
+# cannot know the caller actually processed it, so the record moves to
+# `delivered` (persisted) instead of vanishing. `requeue_event` returns it to
+# `pending` for redelivery — the recovery path for "the consumer died between
+# receiving the burst and acting on it". Entries expire after the TTL.
+_OUTBOX_TTL_ENV = "TELEGRAM_EVENT_OUTBOX_TTL"
+_OUTBOX_TTL_DEFAULT = 86400  # seconds
+_DELIVERED_CAP = 200
+_delivered: Dict[int, Dict[str, Any]] = {}
+
 # --- Incoming event feed (callback mode) ---
 # When enabled, a background task consumes settled bursts and appends them as
 # JSONL lines to the feed file, so an external watcher (e.g. Claude Code's
@@ -145,14 +155,51 @@ def _load_pending_state() -> None:
             continue
     for key in data.get("seen", [])[-_SEEN_CAP:]:
         _seen_ids[key] = None
+    for key, rec in data.get("delivered", {}).items():
+        try:
+            _delivered[int(key)] = rec
+        except (ValueError, TypeError):
+            continue
+    _prune_delivered()
+
+
+def _outbox_ttl() -> float:
+    try:
+        return max(0.0, float(os.getenv(_OUTBOX_TTL_ENV, _OUTBOX_TTL_DEFAULT)))
+    except ValueError:
+        return _OUTBOX_TTL_DEFAULT
+
+
+def _prune_delivered() -> None:
+    """Drop outbox entries past their TTL, then trim to the cap."""
+    cutoff = time.time() - _outbox_ttl()
+    for cid in [c for c, r in _delivered.items() if r.get("delivered_ts", 0) < cutoff]:
+        del _delivered[cid]
+    while len(_delivered) > _DELIVERED_CAP:
+        _delivered.pop(next(iter(_delivered)))
+
+
+def _mark_delivered(chat_id: int) -> None:
+    """Move a burst from pending to the delivered outbox and persist."""
+    rec = _pending_msgs.pop(chat_id, None)
+    if rec is None:
+        return
+    rec["delivered_ts"] = time.time()
+    _delivered[chat_id] = rec
+    _prune_delivered()
+    _save_pending_state()
 
 
 def _save_pending_state() -> None:
-    """Persist pending bursts + dedup set (atomic via tmp+fsync+replace)."""
+    """Persist pending bursts + dedup set + delivered outbox (atomic)."""
     try:
         atomic_write_json(
             _pending_file(),
-            {"pending": _pending_msgs, "seen": list(_seen_ids)[-_SEEN_CAP:]},
+            {
+                "pending": _pending_msgs,
+                "seen": list(_seen_ids)[-_SEEN_CAP:],
+                "delivered": _delivered,
+            },
         )
     except OSError:
         logging.getLogger("telegram_mcp").error("Could not persist incoming-message state")
@@ -227,11 +274,10 @@ async def _feed_loop(settle_ms: int) -> None:
                 # ponytail: append-only file; rotate it manually (tail -F survives rotation)
                 with _open_feed_append() as f:
                     f.write(json.dumps(line, ensure_ascii=False) + "\n")
-                # Pop only after a successful write (no await in between, so no
-                # consumer can observe the burst twice); a write failure retries
-                # the same burst on the next iteration instead of dropping it.
-                _pending_msgs.pop(settled_cid, None)
-                _save_pending_state()
+                # Deliver only after a successful write (no await in between, so
+                # no consumer can observe the burst twice); a write failure
+                # retries the same burst on the next iteration instead.
+                _mark_delivered(settled_cid)
                 continue
             if soonest_remaining is not None:
                 await asyncio.sleep(soonest_remaining)
@@ -495,9 +541,10 @@ async def wait_for_settled_message(
             now = time.monotonic()
             settled_cid, soonest_remaining = _scan_settled(now, settle, only=target)
             if settled_cid is not None:
-                rec = _pending_msgs.pop(settled_cid)
-                _save_pending_state()
-                return json.dumps(_burst_summary(settled_cid, rec), ensure_ascii=False)
+                rec = _pending_msgs[settled_cid]
+                summary = _burst_summary(settled_cid, rec)
+                _mark_delivered(settled_cid)
+                return json.dumps(summary, ensure_ascii=False)
             remaining_total = deadline - now
             if remaining_total <= 0:
                 return json.dumps(
@@ -521,6 +568,47 @@ async def wait_for_settled_message(
                     )
     except Exception as e:
         return log_and_format_error("wait_for_settled_message", e, chat_id=chat_id)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Requeue Delivered Event", openWorldHint=True, idempotentHint=True
+    )
+)
+@validate_id("chat_id")
+async def requeue_event(
+    chat_id: Union[int, str],
+    account: Optional[str] = None,
+) -> str:
+    """
+    Return a delivered incoming-message burst to the pending set so it is
+    delivered again — the recovery path for "the consumer received the burst
+    and then died before acting on it". Delivered bursts are kept in a small
+    persisted outbox (TELEGRAM_EVENT_OUTBOX_TTL seconds, default 86400) for
+    exactly this reason; requeue moves the record back to pending where it is
+    immediately settled, so the next wait_for_settled_message / feed write
+    hands it out again. Idempotent: requeuing a chat with no delivered burst
+    is a no-op that reports requeued=false.
+
+    Args:
+        chat_id: Chat whose last delivered burst should be redelivered
+            (ID, username, or a saved contact alias).
+    """
+    try:
+        _load_pending_state()
+        target = await _wait_target(chat_id, account)
+        rec = _delivered.pop(target, None)
+        if rec is None:
+            return json.dumps({"requeued": False, "chat_id": target}, ensure_ascii=False)
+        rec.pop("delivered_ts", None)
+        now = time.monotonic()
+        rec["first_ts"] = rec["last_ts"] = now
+        _pending_msgs[target] = rec
+        _save_pending_state()
+        _get_activity_event().set()
+        return json.dumps({"requeued": True, **_burst_summary(target, rec)}, ensure_ascii=False)
+    except Exception as e:
+        return log_and_format_error("requeue_event", e, chat_id=chat_id)
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Enable Incoming Feed", openWorldHint=True))
@@ -614,6 +702,7 @@ register_incoming_handlers()
 __all__ = [
     "wait_for_new_message",
     "wait_for_settled_message",
+    "requeue_event",
     "register_incoming_handlers",
     "enable_incoming_feed",
     "disable_incoming_feed",

@@ -1,6 +1,7 @@
 """Incoming-event recording: group wake rules, dedup, restart persistence."""
 
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -54,16 +55,19 @@ def _clean_state(monkeypatch, tmp_path):
     events._pending_msgs.clear()
     events._seen_ids.clear()
     events._self_ids.clear()
+    events._delivered.clear()
     monkeypatch.setattr(events, "_pending_loaded", False)
     monkeypatch.setenv("TELEGRAM_PENDING_FILE", str(tmp_path / "pending.json"))
     monkeypatch.delenv(events._INCOMING_GROUPS_ENV, raising=False)
     monkeypatch.delenv("TELEGRAM_EVENT_FEED", raising=False)
     monkeypatch.delenv("TELEGRAM_ALLOWED_CHAT_IDS", raising=False)
+    monkeypatch.delenv("TELEGRAM_EVENT_OUTBOX_TTL", raising=False)
     monkeypatch.setattr(events, "is_chat_allowlist_enabled", lambda: False)
     yield
     events._pending_msgs.clear()
     events._seen_ids.clear()
     events._self_ids.clear()
+    events._delivered.clear()
 
 
 @pytest.mark.asyncio
@@ -147,3 +151,85 @@ async def test_state_survives_restart(tmp_path):
     # ...and the replayed message still dedupes against the restored seen-set.
     await events._on_new_incoming(_event(111, 7, is_private=True))
     assert events._pending_msgs[111]["count"] == 1
+
+
+# --- Delivered-burst outbox + requeue_event ---------------------------------
+
+
+def _burst(chat_id=111, msg_id=7):
+    return {
+        "first_ts": 1.0,
+        "last_ts": 1.0,
+        "count": 1,
+        "first_id": msg_id,
+        "last_id": msg_id,
+        "name": "n",
+        "username": None,
+        "kind": "dm",
+        "topic_id": None,
+        "sender_id": 9,
+    }
+
+
+@pytest.mark.asyncio
+async def test_delivery_moves_burst_to_outbox_not_void():
+    events._pending_msgs[111] = _burst()
+    events._mark_delivered(111)
+    assert 111 not in events._pending_msgs
+    assert 111 in events._delivered
+    # The outbox is persisted — a restart could still requeue it.
+    data = json.loads(events._pending_file().read_text())
+    assert "111" in data["delivered"]
+
+
+@pytest.mark.asyncio
+async def test_requeue_redelivers_burst():
+    events._pending_msgs[111] = _burst()
+    events._mark_delivered(111)
+
+    out = json.loads(await events.requeue_event(chat_id=111))
+    assert out["requeued"] is True
+    assert out["chat_id"] == 111
+    # Requeued burst is immediately settled: next scan hands it out again.
+    assert 111 in events._pending_msgs
+
+    # Requeue is idempotent: nothing delivered since, so a repeat is a no-op.
+    out = json.loads(await events.requeue_event(chat_id=111))
+    assert out["requeued"] is False
+
+
+@pytest.mark.asyncio
+async def test_requeue_without_delivery_is_noop():
+    out = json.loads(await events.requeue_event(chat_id=111))
+    assert out["requeued"] is False
+
+
+@pytest.mark.asyncio
+async def test_outbox_survives_restart():
+    events._pending_msgs[111] = _burst()
+    events._mark_delivered(111)
+
+    events._pending_msgs.clear()
+    events._delivered.clear()
+    events._pending_loaded = False
+    events._load_pending_state()
+
+    assert 111 in events._delivered  # deliverable after restart
+    out = json.loads(await events.requeue_event(chat_id=111))
+    assert out["requeued"] is True
+
+
+def test_outbox_ttl_prunes_old_entries(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_EVENT_OUTBOX_TTL", "60")
+    events._delivered[111] = {**_burst(), "delivered_ts": time.time() - 120}
+    events._delivered[222] = {**_burst(), "delivered_ts": time.time()}
+    events._prune_delivered()
+    assert 111 not in events._delivered
+    assert 222 in events._delivered
+
+
+def test_outbox_capped_at_200():
+    for i in range(250):
+        events._delivered[i] = {**_burst(), "delivered_ts": time.time()}
+    events._prune_delivered()
+    assert len(events._delivered) == 200
