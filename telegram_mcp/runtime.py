@@ -739,6 +739,17 @@ def is_multi_mode() -> bool:
     return len(clients) > 1
 
 
+def ops_journal_for(cl: TelegramClient, account: str = None):
+    """Durable operation journal for this client's session.
+
+    One journal per session identity: an ``operation_id`` deduplicates sends
+    for the account that owns the session, across process restarts.
+    """
+    from telegram_mcp.opsjournal import OperationJournal, journal_path
+
+    return OperationJournal(journal_path(session_identity(cl), account or "default"))
+
+
 def with_account(readonly=False):
     """Decorator that adds multi-account support to MCP tools.
 

@@ -2,6 +2,12 @@
 
 from telegram_mcp.runtime import *
 from telegram_mcp import transcription
+from telegram_mcp.opsjournal import (
+    message_ids,
+    receipt_message_id,
+    run_operation,
+    stable_random_id,
+)
 
 # Domain used to build message permalinks. Overridable because the default is a
 # single point of failure: on 2026-07-13 the .me registry put t.me on serverHold
@@ -456,24 +462,47 @@ async def get_messages(
         )
 
 
-async def _send_rich(cl, entity, text: str, parse_mode: str, reply_to: Optional[int] = None):
+async def _send_rich(
+    cl,
+    entity,
+    text: str,
+    parse_mode: str,
+    reply_to: Optional[int] = None,
+    operation_id: Optional[str] = None,
+    account: Optional[str] = None,
+):
     """Send text as a server-parsed rich message. Returns a JSON result string."""
     import random
 
     if not await account_is_premium(cl):
         return premium_required_result("send_message")
+    random_id = (
+        stable_random_id(operation_id, get_marked_id(entity))
+        if operation_id
+        else random.randint(0, 2**62)
+    )
     try:
-        await cl(
-            functions.messages.SendMessageRequest(
-                peer=entity,
-                message=text,
-                random_id=random.randint(0, 2**62),
-                reply_to=(
-                    types.InputReplyToMessage(reply_to_msg_id=reply_to) if reply_to else None
-                ),
-                rich_message=make_rich_input(parse_mode, text),
-            )
+        request = functions.messages.SendMessageRequest(
+            peer=entity,
+            message=text,
+            random_id=random_id,
+            reply_to=(types.InputReplyToMessage(reply_to_msg_id=reply_to) if reply_to else None),
+            rich_message=make_rich_input(parse_mode, text),
         )
+        if operation_id:
+            return await run_operation(
+                ops_journal_for(cl, account),
+                operation_id,
+                "send_message",
+                {"chat_id": get_marked_id(entity)},
+                fn=lambda: cl(request),
+                receipt=lambda r: {
+                    "sent": True,
+                    "rich": True,
+                    "message_id": receipt_message_id(r, random_id),
+                },
+            )
+        result = await cl(request)
     except telethon.errors.RPCError as e:
         # Premium can lapse between the check above and the send — same refusal.
         if is_premium_rpc_error(e):
@@ -564,6 +593,7 @@ async def send_message(
     message: str,
     parse_mode: Optional[str] = None,
     format_date: Optional[str] = None,
+    operation_id: Optional[str] = None,
     account: str = None,
 ) -> str:
     """
@@ -588,6 +618,11 @@ async def send_message(
             {"sent": false, "reason": "telegram_premium_required"} result tells you to
             reformat and retry with 'md'/'html'. Premium is re-checked on every call
             (it can expire or be bought at any time).
+        operation_id: Optional idempotency key. The send is journaled under this
+            key: a retry returns the recorded result instead of sending again,
+            the Telegram random_id is derived from it (so even a lost-response
+            retry can't duplicate), and the result is a JSON receipt carrying
+            status and message_id instead of a plain string.
     """
     try:
         cl = get_client(account)
@@ -603,11 +638,20 @@ async def send_message(
                 chat_id=chat_id,
             )
 
+        random_id = stable_random_id(operation_id, get_marked_id(entity)) if operation_id else None
+
         if parse_mode and parse_mode.lower() in RICH_PARSE_MODES:
             conflict = _chip_conflict(format_date)
             if conflict:
                 return conflict
-            return await _send_rich(cl, entity, message, parse_mode.lower())
+            return await _send_rich(
+                cl,
+                entity,
+                message,
+                parse_mode.lower(),
+                operation_id=operation_id,
+                account=account,
+            )
         if format_date:
             conflict = _chip_conflict(parse_mode)
             if conflict:
@@ -617,15 +661,47 @@ async def send_message(
                 return chip_error
             import random
 
-            await cl(
-                functions.messages.SendMessageRequest(
-                    peer=entity,
-                    message=message,
-                    random_id=random.randint(0, 2**62),
-                    entities=[chip],
-                )
+            request = functions.messages.SendMessageRequest(
+                peer=entity,
+                message=message,
+                random_id=random_id if random_id is not None else random.randint(0, 2**62),
+                entities=[chip],
             )
+            if operation_id:
+                return await run_operation(
+                    ops_journal_for(cl, account),
+                    operation_id,
+                    "send_message",
+                    {"chat_id": get_marked_id(entity)},
+                    fn=lambda: cl(request),
+                    receipt=lambda r: {
+                        "sent": True,
+                        "message_id": receipt_message_id(r, random_id),
+                    },
+                )
+            await cl(request)
             return "Message sent successfully."
+        if operation_id:
+            # Low-level request so the deterministic random_id reaches Telegram;
+            # parse semantics match the cl.send_message path exactly.
+            text, msg_entities = await cl._parse_message_text(message, parse_mode)
+            request = functions.messages.SendMessageRequest(
+                peer=entity,
+                message=text,
+                random_id=random_id,
+                entities=msg_entities or None,
+            )
+            return await run_operation(
+                ops_journal_for(cl, account),
+                operation_id,
+                "send_message",
+                {"chat_id": get_marked_id(entity)},
+                fn=lambda: cl(request),
+                receipt=lambda r: {
+                    "sent": True,
+                    "message_id": receipt_message_id(r, random_id),
+                },
+            )
         await cl.send_message(entity, message, parse_mode=parse_mode)
         return "Message sent successfully."
     except Exception as e:
@@ -647,6 +723,7 @@ async def send_scheduled_message(
     message: str,
     schedule_date: Union[str, int],
     parse_mode: Optional[str] = None,
+    operation_id: Optional[str] = None,
     account: str = None,
 ) -> str:
     """
@@ -663,6 +740,9 @@ async def send_scheduled_message(
             If omitted, the client default applies (Markdown), as in earlier versions.
             Rich modes ('rich', 'rich_md', 'rich_markdown', 'rich_html') are not
             supported for scheduled messages.
+        operation_id: Optional idempotency key — the scheduling call is journaled
+            under it, so a retry returns the recorded receipt instead of
+            scheduling a duplicate.
     """
     try:
         if parse_mode and parse_mode.lower() in RICH_PARSE_MODES:
@@ -682,6 +762,15 @@ async def send_scheduled_message(
             # Omitted parse_mode keeps Telethon's client default (Markdown) for
             # backward compatibility; 'plain' maps to None, which disables parsing.
             kwargs["parse_mode"] = None if parse_mode.lower() == "plain" else parse_mode
+        if operation_id:
+            return await run_operation(
+                ops_journal_for(cl, account),
+                operation_id,
+                "send_scheduled_message",
+                {"chat_id": get_marked_id(entity), "scheduled_for": dt.isoformat()},
+                fn=lambda: cl.send_message(entity, message, **kwargs),
+                receipt=lambda r: {"sent": True, "message_ids": message_ids(r)},
+            )
         result = await cl.send_message(entity, message, **kwargs)
         message_id = getattr(result, "id", None)
         return f"Scheduled message {message_id} for {dt.isoformat()} in chat {chat_id}."
