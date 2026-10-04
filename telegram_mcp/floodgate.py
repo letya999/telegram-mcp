@@ -12,6 +12,13 @@ Telegram imposed. :class:`GatedTelegramClient` enforces it on every request
 going through ``client(...)`` -- service calls (peer resolution, connection
 checks, updates, media) are covered too, not just MCP tool calls.
 
+The same gate also paces requests *proactively* per operation class
+(messages / forwards / searches) when ``TELEGRAM_PACE_*`` is configured:
+reactive FloodWait handling limits the damage after Telegram complains,
+spacing limits how often it needs to. The two mechanisms are deliberately
+separate -- pacing state lives only in memory (a restarted process pacing
+from zero is safe), while FloodWait deadlines must outlive the process.
+
 Per-chat slow mode (``SlowModeWaitError``) is deliberately not recorded here:
 it is a sibling of ``FloodWaitError``, not a subclass, and it restricts one
 chat, not the account. Recording it under the account key would throttle
@@ -24,6 +31,7 @@ will violate.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -95,6 +103,82 @@ class FloodWaitState:
         self._until = max(self._until, until)
 
 
+# Requests grouped by how Telegram's anti-spam heuristics treat them: sends
+# and forwards are the actions that trigger penalties; searches are paced
+# separately because a fan-out (one call per chat) burns quota faster than
+# its own rate suggests. Everything unlisted is unpaced -- reads, edits,
+# deletes and service calls don't need proactive spacing to stay safe.
+_PACING_REQUEST_CLASSES: dict[str, str] = {
+    "SendMessageRequest": "message",
+    "SendMediaRequest": "message",
+    "SendMultiMediaRequest": "message",
+    "ForwardMessagesRequest": "forward",
+    "SearchRequest": "search",
+    "SearchGlobalRequest": "search",
+    "SearchGifsRequest": "search",
+}
+
+_PACING_ENV = {
+    "message": "TELEGRAM_PACE_MESSAGES_MS",
+    "forward": "TELEGRAM_PACE_FORWARDS_MS",
+    "search": "TELEGRAM_PACE_SEARCHES_MS",
+}
+
+
+class PacingGate:
+    """Minimum spacing between requests of the same class, per client.
+
+    In-memory only: a restarted process pacing from zero is safe (the worst
+    case is a burst it should have spaced), unlike a lost FloodWait deadline
+    which provokes an escalating penalty.
+    """
+
+    def __init__(self, intervals_ms: dict[str, int]):
+        self._intervals = {cls: ms / 1000.0 for cls, ms in intervals_ms.items() if ms > 0}
+        self._next_at: dict[str, float] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    @classmethod
+    def from_env(cls, label: str) -> "PacingGate":
+        """Read ``TELEGRAM_PACE_*`` (milliseconds), per-label override first."""
+
+        def _ms(name: str) -> int:
+            raw = os.getenv(f"{name}_{label.upper()}") or os.getenv(name) or "0"
+            try:
+                return max(0, int(raw))
+            except ValueError:
+                return 0
+
+        return cls({cls_: _ms(env) for cls_, env in _PACING_ENV.items()})
+
+    @property
+    def configured(self) -> bool:
+        return bool(self._intervals)
+
+    def request_class(self, request) -> Optional[str]:
+        """Pacing class of a TL request, or ``None`` when it is unpaced."""
+        return _PACING_REQUEST_CLASSES.get(type(request).__name__)
+
+    async def wait(self, cls: str) -> None:
+        """Sleep until this class's slot opens; reserve the next slot first.
+
+        The slot is claimed before sleeping so concurrent callers queue up
+        back-to-back rather than waking together into a burst -- which is
+        precisely the pattern pacing exists to prevent.
+        """
+        interval = self._intervals.get(cls)
+        if not interval:
+            return
+        lock = self._locks.setdefault(cls, asyncio.Lock())
+        async with lock:
+            now = time.monotonic()
+            next_at = self._next_at.get(cls, 0.0)
+            self._next_at[cls] = max(now, next_at) + interval
+            delay = next_at - now
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+
 class GatedTelegramClient(TelegramClient):
     """TelegramClient that honours a persisted FloodWait deadline.
 
@@ -104,9 +188,13 @@ class GatedTelegramClient(TelegramClient):
     asking Telegram. When Telegram itself reports a FloodWait, the deadline
     is persisted before the error propagates, so a crash or restart cannot
     lose it.
+
+    Attach a :class:`PacingGate` to ``_pacing`` for proactive per-class
+    spacing; without one, behaviour is unchanged.
     """
 
     _flood_gate: Optional[FloodWaitState] = None
+    _pacing: Optional[PacingGate] = None
 
     async def __call__(self, request, ordered=False, flood_sleep_threshold=None):
         gate = self._flood_gate
@@ -114,6 +202,11 @@ class GatedTelegramClient(TelegramClient):
             wait = gate.retry_after()
             if wait > 0:
                 raise FloodWaitError(request=request, capture=max(1, int(wait)))
+        pacing = self._pacing
+        if pacing is not None:
+            cls = pacing.request_class(request)
+            if cls is not None:
+                await pacing.wait(cls)
         try:
             return await super().__call__(
                 request, ordered=ordered, flood_sleep_threshold=flood_sleep_threshold
