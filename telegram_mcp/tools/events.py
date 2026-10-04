@@ -20,10 +20,26 @@ from telethon import events as _events
 from telethon import utils
 
 from telegram_mcp.runtime import *  # mcp, clients, ToolAnnotations, log_and_format_error
+from telegram_mcp.floodgate import state_dir
 
-# chat_id -> {first_ts, last_ts, count, first_id, last_id, name, username}
+# chat_id -> {first_ts, last_ts, count, first_id, last_id, name, username, kind, topic_id, sender_id}
 _pending_msgs: Dict[int, Dict[str, Any]] = {}
 _activity_event: Optional[asyncio.Event] = None
+
+# Group chats are only watched when TELEGRAM_INCOMING_GROUPS is truthy — and
+# even then only messages that name us (mention) or answer us (reply to our
+# own message) are recorded; reading a chat and being woken by it are
+# different permissions.
+_INCOMING_GROUPS_ENV = "TELEGRAM_INCOMING_GROUPS"
+
+# Pending bursts and the seen-set are persisted so a crash/restart neither
+# loses an undelivered burst nor replays an already-recorded message (Telegram
+# re-delivers updates after reconnect).
+_PENDING_FILE_ENV = "TELEGRAM_PENDING_FILE"
+_SEEN_CAP = 5000
+_seen_ids: Dict[str, None] = {}  # insertion-ordered set of "chat_id:msg_id"
+_self_ids: Dict[int, Optional[int]] = {}
+_pending_loaded = False
 
 # --- Incoming event feed (callback mode) ---
 # When enabled, a background task consumes settled bursts and appends them as
@@ -91,7 +107,70 @@ def _burst_summary(chat_id: int, rec: Dict[str, Any]) -> Dict[str, Any]:
         "first_message_id": rec["first_id"],
         "last_message_id": rec["last_id"],
         "burst_seconds": round(rec["last_ts"] - rec["first_ts"], 2),
+        # dm | mention | reply — what qualified this burst for delivery.
+        "kind": rec.get("kind", "dm"),
+        "topic_id": rec.get("topic_id"),
+        "sender_id": rec.get("sender_id"),
     }
+
+
+def _pending_file() -> Path:
+    """Where pending bursts + the dedup set live; TELEGRAM_PENDING_FILE overrides."""
+    override = os.getenv(_PENDING_FILE_ENV)
+    if override:
+        return Path(override)
+    return state_dir() / "incoming_pending.json"
+
+
+def _load_pending_state() -> None:
+    """Restore undelivered bursts and the dedup set after a restart (once)."""
+    global _pending_loaded
+    if _pending_loaded:
+        return
+    _pending_loaded = True
+    try:
+        data = json.loads(_pending_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    now = time.monotonic()
+    for key, rec in data.get("pending", {}).items():
+        try:
+            rec = dict(rec)
+            # monotonic timestamps don't survive restarts: a restored burst is
+            # already settled by definition, so flush it promptly.
+            rec["first_ts"] = rec["last_ts"] = now
+            _pending_msgs[int(key)] = rec
+        except (ValueError, TypeError):
+            continue
+    for key in data.get("seen", [])[-_SEEN_CAP:]:
+        _seen_ids[key] = None
+
+
+def _save_pending_state() -> None:
+    """Persist pending bursts + dedup set (atomic-ish via tmp+replace)."""
+    path = _pending_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(
+            json.dumps(
+                {"pending": _pending_msgs, "seen": list(_seen_ids)[-_SEEN_CAP:]},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+    except OSError:
+        logging.getLogger("telegram_mcp").error("Could not persist incoming-message state")
+
+
+async def _self_id(client) -> Optional[int]:
+    """This account's user id, fetched once per client (needed for reply detection)."""
+    key = id(client)
+    if key not in _self_ids:
+        me = await client.get_me()
+        _self_ids[key] = getattr(me, "id", None)
+    return _self_ids[key]
 
 
 def _default_feed_file() -> Path:
@@ -158,6 +237,7 @@ async def _feed_loop(settle_ms: int) -> None:
                 # consumer can observe the burst twice); a write failure retries
                 # the same burst on the next iteration instead of dropping it.
                 _pending_msgs.pop(settled_cid, None)
+                _save_pending_state()
                 continue
             if soonest_remaining is not None:
                 await asyncio.sleep(soonest_remaining)
@@ -199,20 +279,62 @@ def _maybe_autostart_feed() -> None:
 
 
 async def _on_new_incoming(event) -> None:
-    """Record incoming private (non-bot, non-self) messages for the debounce tools."""
+    """Record incoming (non-bot, non-self) messages for the debounce tools.
+
+    Private chats always qualify. Group chats qualify only when
+    TELEGRAM_INCOMING_GROUPS is set AND the message mentions us or replies to
+    one of our own messages — "the agent may read a group" is not "the agent
+    wakes on every group message".
+    """
     try:
-        if not event.is_private:
-            return
+        _load_pending_state()
+        msg = event.message
+        chat_id = event.chat_id
+        msg_id = getattr(msg, "id", None)
+
+        seen_key = f"{chat_id}:{msg_id}"
+        if seen_key in _seen_ids:
+            return  # replayed update — e.g. difference catch-up after reconnect
+
         sender = await event.get_sender()
         if sender is None:
             return
         if getattr(sender, "bot", False) or getattr(sender, "is_self", False):
             return
-        chat_id = event.chat_id
+
+        kind = "dm"
+        topic_id = None
+        if not event.is_private:
+            if not _parse_bool_env(os.getenv(_INCOMING_GROUPS_ENV), False):
+                return
+            reply_to = getattr(msg, "reply_to", None)
+            if reply_to is not None:
+                topic_id = getattr(reply_to, "reply_to_top_id", None) or (
+                    getattr(reply_to, "reply_to_msg_id", None)
+                    if getattr(reply_to, "forum_topic", False)
+                    else None
+                )
+            if getattr(msg, "mentioned", False):
+                kind = "mention"
+            else:
+                # Whether the reply targets our own message needs the replied
+                # message — one lookup, only for non-mention group replies.
+                me_id = await _self_id(event.client)
+                if me_id is None or not getattr(msg, "is_reply", False):
+                    return
+                replied = await event.get_reply_message()
+                if replied is None or getattr(replied, "sender_id", None) != me_id:
+                    return
+                kind = "reply"
+
         if is_chat_allowlist_enabled() and not is_chat_allowed(chat_id, sender):
             return
+
+        _seen_ids[seen_key] = None
+        while len(_seen_ids) > _SEEN_CAP:
+            _seen_ids.pop(next(iter(_seen_ids)))
+
         now = time.monotonic()
-        msg_id = event.message.id
         rec = _pending_msgs.get(chat_id)
         if rec is None:
             _pending_msgs[chat_id] = {
@@ -223,6 +345,9 @@ async def _on_new_incoming(event) -> None:
                 "last_id": msg_id,
                 "name": utils.get_display_name(sender) or str(chat_id),
                 "username": getattr(sender, "username", None),
+                "kind": kind,
+                "topic_id": topic_id,
+                "sender_id": getattr(sender, "id", None),
             }
         else:
             # Handlers for the same chat can interleave across the get_sender()
@@ -231,6 +356,13 @@ async def _on_new_incoming(event) -> None:
             rec["first_id"] = min(rec["first_id"], msg_id)
             rec["last_id"] = max(rec["last_id"], msg_id)
             rec["count"] += 1
+            # A mention is the stronger wake reason; never downgrade it.
+            _KIND_RANK = {"dm": 0, "reply": 1, "mention": 2}
+            if _KIND_RANK.get(kind, 0) > _KIND_RANK.get(rec.get("kind", "dm"), 0):
+                rec["kind"] = kind
+            if topic_id is not None:
+                rec["topic_id"] = topic_id
+        _save_pending_state()
         _maybe_autostart_feed()
         _get_activity_event().set()
     except Exception:
@@ -370,6 +502,7 @@ async def wait_for_settled_message(
             settled_cid, soonest_remaining = _scan_settled(now, settle, only=target)
             if settled_cid is not None:
                 rec = _pending_msgs.pop(settled_cid)
+                _save_pending_state()
                 return json.dumps(_burst_summary(settled_cid, rec), ensure_ascii=False)
             remaining_total = deadline - now
             if remaining_total <= 0:
